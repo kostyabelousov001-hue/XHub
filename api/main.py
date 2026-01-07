@@ -1,158 +1,89 @@
-import os
-import uuid
-import random
-import datetime
+import os, uuid, random
 from fastapi import FastAPI, HTTPException, Request
 from supabase import create_client, Client
 from pydantic import BaseModel
-from typing import List, Optional
 
-app = FastAPI(title="XHUB CORE SERVER V8.1")
+app = FastAPI()
 
-# --- ИНИЦИАЛИЗАЦИЯ ---
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
 ADMIN_SECRET = "PyTest"
 
-try:
-    supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
-except Exception as e:
-    print(f"Supabase Init Error: {e}")
-    supabase = None
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-# --- MODELS ---
-class RegRequest(BaseModel):
-    username: str
-    password: str
-    email: str
+class RegData(BaseModel):
+    username: str; password: str; email: str
 
-class VerifyRequest(BaseModel):
-    email: str
-    code: str
-
-class LoginRequest(BaseModel):
-    username: str
-    password: str
-
-class PresenceUpdate(BaseModel):
-    token: str
-    status: str
-    game: str
+class VerifyData(BaseModel):
+    email: str; code: str
 
 class FriendAction(BaseModel):
-    from_user: str
-    to_user: str
-    status: Optional[str] = "pending"
-
-# --- HELPER: АДМИН ДОСТУП ---
-def check_admin(request: Request):
-    key = request.headers.get('x-admin-key')
-    if key != ADMIN_SECRET:
-        raise HTTPException(status_code=403, detail="Forbidden: PyTest key required")
-
-# --- ROUTES: AUTH ---
+    from_user: str; to_user: str; status: str = "pending"
 
 @app.get("/")
-async def health():
-    return {"status": "XHUB_CORE_ONLINE", "db": "OK" if supabase else "FAIL"}
+async def health(): return {"status": "online"}
 
+# --- AUTH ---
 @app.post("/auth/request_reg")
-async def request_reg(data: RegRequest):
-    # 1. Генерим код
+async def request_reg(data: RegData):
     code = str(random.randint(100000, 999999))
-    try:
-        # 2. Создаем запись (is_verified = False)
-        supabase.table("users").insert({
-            "username": data.username, 
-            "password": data.password, 
-            "email": data.email,
-            "verification_code": code,
-            "is_verified": False
-        }).execute()
-        
-        # 3. Ставим задачу Киперу в очередь
-        supabase.table("mail_queue").insert({
-            "recipient": data.email,
-            "subject": "XHUB Verification Code",
-            "body": f"Welcome to XHUB, {data.username}! Your code: {code}",
-            "status": "pending"
-        }).execute()
-        
-        return {"status": "code_sent"}
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+    supabase.table("users").insert({
+        "username": data.username, "password": data.password, 
+        "email": data.email, "verification_code": code, "is_verified": False
+    }).execute()
+    supabase.table("mail_queue").insert({
+        "recipient": data.email, "subject": "XHUB CODE", "body": f"Code: {code}"
+    }).execute()
+    return {"ok": True}
 
 @app.post("/auth/confirm_reg")
-async def confirm_reg(data: VerifyRequest):
-    # Проверяем код
+async def confirm_reg(data: VerifyData):
     res = supabase.table("users").select("*").eq("email", data.email).eq("verification_code", data.code).execute()
-    if not res.data:
-        raise HTTPException(status_code=400, detail="Invalid verification code")
-    
-    # Активируем аккаунт
-    supabase.table("users").update({"is_verified": True}).eq("email", data.email).execute()
-    return {"status": "account_activated"}
+    if res.data:
+        # Прямое принудительное обновление
+        supabase.table("users").update({"is_verified": True}).eq("email", data.email).execute()
+        return {"ok": True}
+    raise HTTPException(400, "Wrong code")
 
 @app.post("/auth/login")
-async def login(data: LoginRequest):
-    res = supabase.table("users").select("*").eq("username", data.username).eq("password", data.password).eq("is_verified", True).execute()
-    if not res.data:
-        raise HTTPException(status_code=401, detail="Invalid credentials or account not verified")
-    
+async def login(data: dict):
+    res = supabase.table("users").select("*").eq("username", data['username']).eq("password", data['password']).eq("is_verified", True).execute()
+    if not res.data: raise HTTPException(401, "Denied")
     token = str(uuid.uuid4())
-    supabase.table("sessions").insert({"username": data.username, "token": token}).execute()
-    return {"auth": True, "token": token, "username": data.username}
+    supabase.table("sessions").insert({"username": data['username'], "token": token}).execute()
+    return {"auth": True, "token": token, "username": data['username']}
 
-# --- ROUTES: SOCIAL & PRESENCE ---
-
-@app.post("/presence/update")
-async def update_presence(data: PresenceUpdate):
-    session = supabase.table("sessions").select("username").eq("token", data.token).execute()
-    if not session.data:
-        raise HTTPException(status_code=403, detail="Invalid Token")
-    
-    user_name = session.data[0]['username']
-    supabase.table("users").update({"status": data.status, "game": data.game}).eq("username", user_name).execute()
-    return {"status": "presence_updated"}
-
-@app.get("/presence/list")
-async def get_presence_list():
-    res = supabase.table("users").select("username, status, game").eq("is_verified", True).execute()
-    return res.data
-
+# --- SOCIAL ---
 @app.post("/friends/add")
-async def add_friend(data: FriendAction):
-    supabase.table("friend_requests").insert({
-        "from_user": data.from_user, 
-        "to_user": data.to_user, 
-        "status": "pending"
-    }).execute()
-    return {"status": "request_sent"}
+async def add_f(data: FriendAction):
+    # Проверка на дубликат заявки
+    exist = supabase.table("friend_requests").select("*").eq("from_user", data.from_user).eq("to_user", data.to_user).execute()
+    if exist.data: return {"status": "already_exists"}
+    supabase.table("friend_requests").insert({"from_user": data.from_user, "to_user": data.to_user}).execute()
+    return {"ok": True}
 
 @app.post("/friends/my_requests")
-async def get_my_requests(data: dict):
-    # Юзер передает свой username, получаем входящие заявки
-    username = data.get("username")
-    res = supabase.table("friend_requests").select("*").eq("to_user", username).eq("status", "pending").execute()
+async def my_req(data: dict):
+    res = supabase.table("friend_requests").select("*").eq("to_user", data['username']).execute()
     return res.data
 
 @app.post("/friends/respond")
-async def respond_friend(data: FriendAction):
-    # data.status должен быть 'accepted' или 'declined'
-    supabase.table("friend_requests").update({"status": data.status}).eq("from_user", data.from_user).eq("to_user", data.to_user).execute()
-    return {"status": f"request_{data.status}"}
+async def respond(data: FriendAction):
+    if data.status == "accepted":
+        # Создаем связь и удаляем заявку
+        supabase.table("friendships").insert({"user1": data.from_user, "user2": data.to_user}).execute()
+    supabase.table("friend_requests").delete().eq("from_user", data.from_user).eq("to_user", data.to_user).execute()
+    return {"ok": True}
 
-# --- ROUTES: SYSTEM (KEEPER ONLY) ---
-
+# --- SYSTEM (KEEPER) ---
 @app.get("/sys/get_mail")
-async def get_mail(request: Request):
-    check_admin(request)
-    res = supabase.table("mail_queue").select("*").eq("status", "pending").execute()
-    return res.data
+async def get_m(request: Request):
+    if request.headers.get("x-admin-key") == ADMIN_SECRET:
+        return supabase.table("mail_queue").select("*").eq("status", "pending").execute().data
+    raise HTTPException(403)
 
 @app.post("/sys/confirm_mail")
-async def confirm_mail(request: Request, data: dict):
-    check_admin(request)
-    email = data.get("email")
-    supabase.table("mail_queue").delete().eq("recipient", email).execute()
-    return {"status": "cleared"}
+async def conf_m(request: Request, data: dict):
+    if request.headers.get("x-admin-key") == ADMIN_SECRET:
+        supabase.table("mail_queue").delete().eq("recipient", data['email']).execute()
+        return {"ok": True}
