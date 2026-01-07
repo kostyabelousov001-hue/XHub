@@ -1,25 +1,29 @@
-# app.py - XHUB SERVER V6.0 (Passive Core)
 import uuid
 import random
 import datetime
 import os
 import threading
-from fastapi import FastAPI, HTTPException, Response, Header as HeaderParams
+from fastapi import FastAPI, HTTPException, Header as HeaderParams
 from tinydb import TinyDB, Query
 from pydantic import BaseModel
-import uvicorn
 
-app = FastAPI(title="XHUB SERVER V6.0")
+app = FastAPI(title="XHUB SERVER V6.0 - Vercel Mirror")
 db_lock = threading.Lock()
 
-ADMIN_SECRET = os.environ.get("ADMIN_SECRET", "admin_key_123")
+ADMIN_SECRET = os.environ.get("ADMIN_SECRET", "7#x!Lp@9Qz$3Rk&Yv%Pw*1sN5dF8^A2mG+U4jT6hX0cB?Z/S(e)oV{I}lK-nW<M>rC:yD;gH=b|q")
 
-# --- DATABASE ---
-db = TinyDB('xhub_data.json')
+# --- DATABASE ADAPTATION ---
+# На Vercel запись разрешена только в /tmp
+if os.environ.get('VERCEL'):
+    db_path = '/tmp/xhub_data.json'
+else:
+    db_path = 'xhub_data.json'
+
+db = TinyDB(db_path)
 users_table = db.table('users')
 sessions_table = db.table('sessions')
 pending_table = db.table('pending_reg')
-mail_queue = db.table('mail_queue') # <--- НОВАЯ ТАБЛИЦА: Очередь писем
+mail_queue = db.table('mail_queue')
 User = Query()
 
 # --- MODELS ---
@@ -42,37 +46,24 @@ class PresenceUpdate(BaseModel):
     game: str
 
 # --- API ---
-
 @app.get("/")
-def health(): return {"status": "XHUB V6 Online", "mode": "Passive Mail"}
+def health(): 
+    return {"status": "XHUB V6 Online", "mode": "Vercel Mirror", "db": db_path}
 
 @app.post("/auth/request_reg")
 def request_registration(data: UserRegRequest):
     with db_lock:
         if users_table.search(User.username == data.username):
             raise HTTPException(400, "Username taken")
-        if users_table.search(User.email == data.email):
-            raise HTTPException(400, "Email already used")
-
         code = random.randint(100000, 999999)
-        
-        # 1. Сохраняем код
         pending_table.upsert({
-            "username": data.username,
-            "password": data.password, 
-            "email": data.email,
-            "code": code
+            "username": data.username, "password": data.password, 
+            "email": data.email, "code": code
         }, User.email == data.email)
-
-        # 2. Добавляем задачу в очередь писем для Кипера
         mail_queue.insert({
-            "to": data.email,
-            "subject": "XHUB Code",
-            "body": f"Code: {code}",
-            "status": "pending",
-            "created_at": str(datetime.datetime.now())
+            "to": data.email, "subject": "XHUB Code", "body": f"Code: {code}",
+            "status": "pending", "created_at": str(datetime.datetime.now())
         })
-
     return {"status": "Request queued"}
 
 @app.post("/auth/confirm_reg")
@@ -81,37 +72,27 @@ def confirm_registration(data: VerifyCode):
         record = pending_table.get(User.email == data.email)
         if not record or record['code'] != data.code:
             raise HTTPException(400, "Invalid code")
-
         users_table.insert({
-            "id": str(uuid.uuid4()),
-            "username": record['username'],
-            "password": record['password'],
-            "email": record['email'],
+            "id": str(uuid.uuid4()), "username": record['username'],
+            "password": record['password'], "email": record['email'],
             "status": "Online", "game": "Newbie"
         })
         pending_table.remove(User.email == data.email)
     return {"status": "User created"}
 
-# --- Эндпоинты для Кипера (Почтальона) ---
-
 @app.get("/sys/get_mail")
 def get_pending_mail(x_admin_key: str = HeaderParams(None)):
-    """Кипер забирает письма, которые надо отправить"""
     if x_admin_key != ADMIN_SECRET: raise HTTPException(403)
-    # Отдаем только те, что 'pending'
     return mail_queue.search(Query().status == "pending")
 
 @app.post("/sys/confirm_mail")
 def confirm_mail_sent(data: dict, x_admin_key: str = HeaderParams(None)):
-    """Кипер отчитывается, что отправил письмо"""
     if x_admin_key != ADMIN_SECRET: raise HTTPException(403)
     email = data.get("email")
-    # Удаляем из очереди, раз отправлено
     with db_lock:
         mail_queue.remove(Query().to == email)
     return {"status": "ok"}
 
-# (Остальные эндпоинты Login/Presence такие же, как были)
 @app.post("/auth/login")
 def login(data: UserLogin):
     with db_lock:
@@ -133,6 +114,3 @@ def update_presence(data: PresenceUpdate):
 @app.get("/presence/list")
 def get_friends_list():
     return users_table.all()
-
-if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=7860)
