@@ -10,7 +10,7 @@ from pydantic import BaseModel
 app = FastAPI(title="XHUB SERVER V6.0 - Vercel Mirror")
 db_lock = threading.Lock()
 
-ADMIN_SECRET = os.environ.get("ADMIN_SECRET", "7#x!Lp@9Qz$3Rk&Yv%Pw*1sN5dF8^A2mG+U4jT6hX0cB?Z/S(e)oV{I}lK-nW<M>rC:yD;gH=b|q")
+ADMIN_SECRET = os.environ.get("ADMIN_SECRET")
 
 # --- DATABASE ADAPTATION ---
 # На Vercel запись разрешена только в /tmp
