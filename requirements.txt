@@ -1,4 +1,5 @@
 fastapi
 uvicorn
-tinydb
+supabase
 pydantic
+python-dotenv
