@@ -1,29 +1,19 @@
+import os
+import datetime
 import uuid
 import random
-import datetime
-import os
-import threading
 from fastapi import FastAPI, HTTPException, Header, Request
-from tinydb import TinyDB, Query
+from supabase import create_client, Client
 from pydantic import BaseModel
 
-# --- ИНИЦИАЛИЗАЦИЯ ---
-app = FastAPI(title="XHUB SERVER V6.0 - Vercel Mirror")
-db_lock = threading.Lock()
+app = FastAPI(title="XHUB SERVER V7.0 - Supabase Production")
 
-# Берем секрет из переменных окружения Vercel
-# Если его там нет, будет использовано дефолтное значение (проверь настройки в Dashboard!)
-ADMIN_SECRET = os.environ.get("ADMIN_SECRET", "7#x!Lp@9Qz$3Rk&Yv%Pw*1sN5dF8^A2mG+U4jT6hX0cB?Z/S(e)oV{I}lK-nW<M>rC:yD;gH=b|q")
+# Конфиги из переменных окружения Vercel
+SUPABASE_URL = os.environ.get("SUPABASE_URL")
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
+ADMIN_SECRET = os.environ.get("ADMIN_SECRET")
 
-# --- DATABASE ---
-# Vercel разрешает запись только в /tmp. Вне этой папки будет 500 ошибка.
-db_path = '/tmp/xhub_data.json' if os.environ.get('VERCEL') else 'xhub_data.json'
-db = TinyDB(db_path)
-users_table = db.table('users')
-sessions_table = db.table('sessions')
-pending_table = db.table('pending_reg')
-mail_queue = db.table('mail_queue')
-User = Query()
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 # --- MODELS ---
 class UserRegRequest(BaseModel):
@@ -44,90 +34,57 @@ class PresenceUpdate(BaseModel):
     status: str
     game: str
 
-# --- SYSTEM ENDPOINTS ---
-
+# --- SYSTEM ---
 @app.get("/")
 async def health(): 
-    return {
-        "status": "XHUB V6 Online", 
-        "mode": "Vercel Mirror", 
-        "node": "Production",
-        "timestamp": str(datetime.datetime.now())
-    }
+    return {"status": "XHUB V7 Online", "db": "Supabase Cloud"}
 
 @app.get("/sys/get_mail")
 async def get_pending_mail(request: Request):
-    # Прямое извлечение заголовка для обхода проблем с регистром
-    client_key = request.headers.get('x-admin-key')
-    
-    if not client_key or client_key != ADMIN_SECRET:
-        # В логи Vercel (виртуальные) уйдет инфо о попытке без палева самого ключа
-        print(f"DEBUG: Auth Failed. Header: {bool(client_key)}")
-        raise HTTPException(status_code=403, detail="Forbidden: Admin Key Mismatch")
-        
-    return mail_queue.search(Query().status == "pending")
+    key = request.headers.get('x-admin-key')
+    if key != ADMIN_SECRET: raise HTTPException(403)
+    res = supabase.table("mail_queue").select("*").eq("status", "pending").execute()
+    return res.data
 
 @app.post("/sys/confirm_mail")
 async def confirm_mail_sent(request: Request, data: dict):
-    client_key = request.headers.get('x-admin-key')
-    if not client_key or client_key != ADMIN_SECRET:
-        raise HTTPException(403)
-        
-    email = data.get("email")
-    with db_lock:
-        mail_queue.remove(Query().to == email)
+    key = request.headers.get('x-admin-key')
+    if key != ADMIN_SECRET: raise HTTPException(403)
+    supabase.table("mail_queue").delete().eq("recipient", data.get("email")).execute()
     return {"status": "ok"}
 
-# --- AUTH & PRESENCE ---
-
+# --- AUTH ---
 @app.post("/auth/request_reg")
 async def request_registration(data: UserRegRequest):
-    with db_lock:
-        if users_table.search(User.username == data.username):
-            raise HTTPException(400, "Username taken")
-        code = random.randint(100000, 999999)
-        pending_table.upsert({
-            "username": data.username, "password": data.password, 
-            "email": data.email, "code": code
-        }, User.email == data.email)
-        mail_queue.insert({
-            "to": data.email, "subject": "XHUB Code", "body": f"Code: {code}",
-            "status": "pending", "created_at": str(datetime.datetime.now())
-        })
-    return {"status": "Request queued"}
-
-@app.post("/auth/confirm_reg")
-async def confirm_registration(data: VerifyCode):
-    with db_lock:
-        record = pending_table.get(User.email == data.email)
-        if not record or record['code'] != data.code:
-            raise HTTPException(400, "Invalid code")
-        users_table.insert({
-            "id": str(uuid.uuid4()), "username": record['username'],
-            "password": record['password'], "email": record['email'],
-            "status": "Online", "game": "Newbie"
-        })
-        pending_table.remove(User.email == data.email)
-    return {"status": "User created"}
+    code = random.randint(100000, 999999)
+    # Используем mail_queue как временное хранилище кода (для простоты)
+    mail_data = {
+        "recipient": data.email,
+        "subject": "XHUB Verification",
+        "body": f"User: {data.username} | Code: {code} | Pass: {data.password}",
+        "status": "pending"
+    }
+    supabase.table("mail_queue").insert(mail_data).execute()
+    return {"status": "pending_verification"}
 
 @app.post("/auth/login")
 async def login(data: UserLogin):
-    with db_lock:
-        user = users_table.get((User.username == data.username) & (User.password == data.password))
-        if user:
-            token = str(uuid.uuid4())
-            sessions_table.insert({"token": token, "username": user['username']})
-            return {"auth": True, "token": token, "username": user['username']}
-    raise HTTPException(401, "Bad credentials")
+    res = supabase.table("users").select("*").eq("username", data.username).eq("password", data.password).execute()
+    if res.data:
+        token = str(uuid.uuid4())
+        supabase.table("sessions").insert({"username": data.username, "token": token}).execute()
+        return {"auth": True, "token": token, "username": data.username}
+    raise HTTPException(401, "Invalid credentials")
 
 @app.post("/presence/update")
 async def update_presence(data: PresenceUpdate):
-    with db_lock:
-        session = sessions_table.get(User.token == data.token)
-        if not session: raise HTTPException(403)
-        users_table.update({"status": data.status, "game": data.game}, User.username == session['username'])
+    session = supabase.table("sessions").select("username").eq("token", data.token).execute()
+    if not session.data: raise HTTPException(403)
+    username = session.data[0]['username']
+    supabase.table("users").update({"status": data.status, "game": data.game}).eq("username", username).execute()
     return {"status": "ok"}
 
 @app.get("/presence/list")
 async def get_friends_list():
-    return users_table.all()
+    res = supabase.table("users").select("username, status, game").execute()
+    return res.data
